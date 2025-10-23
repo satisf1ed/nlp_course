@@ -163,11 +163,6 @@ class NMTDataModule:
     
 
 def _iter_attention_modules(model):
-    """
-    Пройти по всем SingleHeadAttention в модели (encoder/decoder).
-    Ожидается структура из предыдущих сообщений: enc_layers[i].attn,
-    dec_layers[i].self_attn, dec_layers[i].cross_attn
-    """
     for layer in getattr(model, "enc_layers", []):
         if hasattr(layer, "attn"):
             yield layer.attn
@@ -178,16 +173,11 @@ def _iter_attention_modules(model):
             yield layer.cross_attn
 
 def set_model_rope(model, enabled: bool):
-    """Глобально включить/выключить RoPE у всех attention-модулей."""
     for attn in _iter_attention_modules(model):
         if hasattr(attn, "use_rope"):
             attn.use_rope = bool(enabled)
 
 def set_model_local_window(model, window: Optional[int]):
-    """
-    Поставить «локальное окно» для self-attention энкодера и декодера.
-    Для cross-attention окно обычно не применяют — принудительно None.
-    """
     for layer in getattr(model, "enc_layers", []):
         if hasattr(layer, "attn") and hasattr(layer.attn, "local_window"):
             layer.attn.local_window = window
@@ -197,38 +187,28 @@ def set_model_local_window(model, window: Optional[int]):
         if hasattr(layer, "cross_attn") and hasattr(layer.cross_attn, "local_window"):
             layer.cross_attn.local_window = None  # cross-attn оставляем глобальным
 
-# ====== ИНСПЕКТОР ======
 class NMTInspector:
     """
     Быстрые вызовы:
       - BLEU:     inspector.bleu(dm.valid)
       - Примеры:  inspector.show_examples(dm.valid, n=5)
-      - Внимание: inspector.plot_attention(dm.valid, which="encoder", layer=0, sample=0)
+      - Внимание: inspector.plot_attention(dm.valid, which="encoder"| "decoder_self" | "decoder_cross")
 
-    Управление фичами:
+    Переключатели:
       inspector.set_rope(True/False)
       inspector.set_local_window(w or None)
       inspector.set_kv_cache(True/False)
-      inspector.set_no_repeat_ngram(n or None)
-
-    Или на время одного вызова:
-      inspector.bleu(dm.valid, opts={"use_cache": True, "no_repeat_ngram": 3})
     """
 
-    def __init__(self, model, dm, device: Optional[str] = None,
-                 use_cache: bool = False,
-                 no_repeat_ngram: Optional[int] = None):
+    def __init__(self, model, dm, device: Optional[str] = None, use_cache: bool = False):
         self.model = model
         self.dm = dm
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.model.eval()
-
-        # runtime-параметры генерации
         self.use_cache = bool(use_cache)
-        self.no_repeat_ngram = no_repeat_ngram
 
-    # ---------- управление фичами ----------
+    # -------- переключатели --------
     def set_rope(self, enabled: bool):
         set_model_rope(self.model, enabled)
 
@@ -238,10 +218,7 @@ class NMTInspector:
     def set_kv_cache(self, enabled: bool):
         self.use_cache = bool(enabled)
 
-    def set_no_repeat_ngram(self, n: Optional[int]):
-        self.no_repeat_ngram = n
-
-    # ---------- служебные утилиты ----------
+    # -------- утилиты --------
     def _first_pad_index(self, ids: List[int], pad_idx: int) -> int:
         for i, t in enumerate(ids):
             if int(t) == pad_idx:
@@ -272,7 +249,7 @@ class NMTInspector:
                       title: str = "Карта внимания"):
         attn_map = np.nan_to_num(attn_map, nan=0.0, posinf=0.0, neginf=0.0)
         if attn_map.ndim != 2:
-            raise ValueError(f"Attention map must be 2D [Lq,Lk], got shape {attn_map.shape}")
+            raise ValueError(f"Attention map must be 2D [Lq,Lk], got {attn_map.shape}")
         Lq, Lk = attn_map.shape
         plt.figure(figsize=(max(6, Lk * 0.4), max(4, Lq * 0.4)))
         plt.imshow(attn_map, aspect='auto', interpolation='nearest', vmin=0.0, vmax=1.0)
@@ -298,46 +275,29 @@ class NMTInspector:
             return attn
         raise ValueError(f"Unexpected attention ndim={attn.ndim}, expected 2 or 3.")
 
-    # ---------- генерация / BLEU / примеры ----------
+    # -------- генерация / BLEU / примеры --------
     @torch.no_grad()
-    def _generate(self, src: torch.Tensor, *, opts: Optional[Dict[str, Any]] = None) -> torch.Tensor:
-        """
-        Внутренний генератор, который пробрасывает флаги:
-          - use_cache (KV-cache)
-          - no_repeat_ngram
-        """
-        o = {"use_cache": self.use_cache, "no_repeat_ngram": self.no_repeat_ngram}
-        if opts:
-            o.update(opts)
+    def _generate(self, src: torch.Tensor) -> torch.Tensor:
         return self.model.generate(
             src,
             bos_id=self.dm.BOS_IDX,
             eos_id=self.dm.EOS_IDX,
-            max_new_tokens=src.size(1) - 1,  # по умолчанию – не длиннее источника
-            no_repeat_ngram=o["no_repeat_ngram"],
-            use_cache=o["use_cache"],
+            max_new_tokens=src.size(1) - 1,
+            use_cache=self.use_cache,
         )
 
     @torch.no_grad()
-    def translate_ids(self, src_ids: List[int], max_len: int = 64,
-                      *, opts: Optional[Dict[str, Any]] = None) -> List[int]:
+    def translate_ids(self, src_ids: List[int], max_len: int = 64) -> List[int]:
         src = torch.tensor([src_ids], dtype=torch.long, device=self.device)
-        o = {"use_cache": self.use_cache, "no_repeat_ngram": self.no_repeat_ngram}
-        if opts:
-            o.update(opts)
         out = self.model.generate(
-            src,
-            bos_id=self.dm.BOS_IDX, eos_id=self.dm.EOS_IDX,
-            max_new_tokens=max_len-1,
-            no_repeat_ngram=o["no_repeat_ngram"],
-            use_cache=o["use_cache"],
+            src, bos_id=self.dm.BOS_IDX, eos_id=self.dm.EOS_IDX,
+            max_new_tokens=max_len-1, use_cache=self.use_cache
         )
         return out[0].tolist()
 
     @torch.no_grad()
     def bleu(self, loader: DataLoader, max_len: Optional[int] = None,
-             num_batches: Optional[int] = None, *,
-             opts: Optional[Dict[str, Any]] = None) -> float:
+             num_batches: Optional[int] = None) -> float:
         smoothie = SmoothingFunction().method4
         refs, hyps = [], []
         processed = 0
@@ -347,15 +307,10 @@ class NMTInspector:
             B = src.size(0)
             for i in range(B):
                 src_i = src[i:i+1].to(self.device)
-                o = {"use_cache": self.use_cache, "no_repeat_ngram": self.no_repeat_ngram}
-                if opts:
-                    o.update(opts)
                 gen = self.model.generate(
-                    src_i,
-                    bos_id=self.dm.BOS_IDX, eos_id=self.dm.EOS_IDX,
+                    src_i, bos_id=self.dm.BOS_IDX, eos_id=self.dm.EOS_IDX,
                     max_new_tokens=(max_len or src_i.size(1))-1,
-                    no_repeat_ngram=o["no_repeat_ngram"],
-                    use_cache=o["use_cache"],
+                    use_cache=self.use_cache
                 )[0].tolist()
 
                 tgt_ids = tgt[i].tolist()
@@ -377,25 +332,18 @@ class NMTInspector:
         return corpus_bleu(refs, hyps, smoothing_function=smoothie) * 100.0
 
     @torch.no_grad()
-    def show_examples(self, loader: DataLoader, n: int = 5, max_len: Optional[int] = None,
-                      *, opts: Optional[Dict[str, Any]] = None):
+    def show_examples(self, loader: DataLoader, n: int = 5, max_len: Optional[int] = None):
         printed = 0
         self.model.eval()
         for src, tgt in loader:
             B = src.size(0)
             for i in range(B):
-                src_i = src[i:i+1].to(self.device)
-                o = {"use_cache": self.use_cache, "no_repeat_ngram": self.no_repeat_ngram}
-                if opts:
-                    o.update(opts)
                 gen = self.model.generate(
-                    src_i,
+                    src[i:i+1].to(self.device),
                     bos_id=self.dm.BOS_IDX, eos_id=self.dm.EOS_IDX,
                     max_new_tokens=(max_len or src.size(1))-1,
-                    no_repeat_ngram=o["no_repeat_ngram"],
-                    use_cache=o["use_cache"],
+                    use_cache=self.use_cache
                 )[0].tolist()
-
                 src_text  = self.dm.decode_ids(src[i].tolist(), lang="src", stop_at_eos=False)
                 pred_text = self.dm.decode_ids(gen, lang="tgt", stop_at_eos=True)
                 true_text = self.dm.decode_ids(tgt[i].tolist(), lang="tgt", stop_at_eos=True)
@@ -407,7 +355,7 @@ class NMTInspector:
                 if printed >= n:
                     return
 
-    # ---------- визуализация внимания (без PAD) ----------
+    # -------- визуализация внимания (без PAD) --------
     def _run_forward_for_attention(self, src: torch.Tensor, tgt: torch.Tensor):
         self.model.eval()
         with torch.no_grad():
@@ -418,19 +366,16 @@ class NMTInspector:
                        which: str = "encoder",
                        layer: int = 0,
                        sample: int = 0):
-        # 1) возьмём батч и прогоним (teacher forcing)
         src_batch, tgt_batch = next(iter(loader))
         src_batch = src_batch.to(self.device)
         tgt_batch = tgt_batch.to(self.device)
         self._run_forward_for_attention(src_batch, tgt_batch)
 
-        # 2) выберем пример и фактические длины (без PAD)
         src_ids = src_batch[sample].tolist()
         tgt_ids = tgt_batch[sample].tolist()
         L_src    = self._effective_len_src(src_ids)
         L_dec_in = self._effective_len_tgt_input(tgt_ids)
 
-        # 3) достанем карту внимания и подписи
         if which == "encoder":
             attn_mod = self.model.enc_layers[layer].attn
             if attn_mod.last_attention is None:
@@ -439,6 +384,7 @@ class NMTInspector:
             tokens = self._ids_to_tokens(src_ids[:L_src], self.dm.itos_src, skip_pad=True)
             self._plot_heatmap(attn_map, y_labels=tokens, x_labels=tokens,
                                title=f"Карта внимания (Encoder layer {layer})")
+
         elif which == "decoder_self":
             attn_mod = self.model.dec_layers[layer].self_attn
             if attn_mod.last_attention is None:
@@ -447,6 +393,7 @@ class NMTInspector:
             tokens = self._ids_to_tokens(tgt_ids[:-1][:L_dec_in], self.dm.itos_tgt, skip_pad=True)
             self._plot_heatmap(attn_map, y_labels=tokens, x_labels=tokens,
                                title=f"Карта внимания (Decoder SELF layer {layer})")
+
         elif which == "decoder_cross":
             attn_mod = self.model.dec_layers[layer].cross_attn
             if attn_mod.last_attention is None:
